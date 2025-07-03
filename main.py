@@ -7,18 +7,28 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 import datetime
 
 # 🔐 المفاتيح من المتغيرات البيئية في Railway
-ALPHA_KEY = os.getenv("ALPHA_KEY")
+TWELVE_API_KEY = os.getenv("TD_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# 🟡 جلب بيانات الذهب
+# 🟡 جلب بيانات الذهب من Twelve Data
 def fetch_gold_data():
-    url = f"https://www.alphavantage.co/query?function=FX_DAILY&from_symbol=XAU&to_symbol=USD&apikey={ALPHA_KEY}&outputsize=full"
+    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1day&outputsize=500&apikey={TWELVE_API_KEY}"
     res = requests.get(url).json()
-    if "Time Series FX (Daily)" not in res:
+
+    if "values" not in res:
+        print("📛 Twelve Data API response:", res)
         return None
-    data = res["Time Series FX (Daily)"]
-    df = pd.DataFrame(data).T.astype(float).sort_index()
-    df.rename(columns={"4. close": "close", "2. high": "high", "3. low": "low", "1. open": "open"}, inplace=True)
+
+    df = pd.DataFrame(res["values"])
+    df = df.rename(columns={
+        "datetime": "date",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+    })
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    df = df.sort_values("date").reset_index(drop=True)
     return df
 
 # 🔎 FVG – Fair Value Gap
@@ -139,7 +149,7 @@ async def handle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ فشل في جلب بيانات الذهب.")
         return
 
-    mode = query.data  # "scalp" or "swing"
+    mode = query.data
 
     if mode == "scalp":
         df = df.tail(7)
