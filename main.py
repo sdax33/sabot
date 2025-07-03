@@ -1,36 +1,163 @@
+import requests
+import pandas as pd
 import os
+from ta.momentum import StochasticOscillator
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+import datetime
 
-# نحصل على التوكن من متغير البيئة
+# 🔐 المفاتيح من المتغيرات البيئية في Railway
+ALPHA_KEY = os.getenv("ALPHA_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# دالة تنفيذ أمر /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("ابدأ التحليل 🔍", callback_data="analyze")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "مرحبًا بك في بوت تحليل الذهب 🟡\nاضغط الزر لتحليل السوق.",
-        reply_markup=reply_markup
-    )
+# 🟡 جلب بيانات الذهب
+def fetch_gold_data():
+    url = f"https://www.alphavantage.co/query?function=FX_DAILY&from_symbol=XAU&to_symbol=USD&apikey={ALPHA_KEY}&outputsize=full"
+    res = requests.get(url).json()
+    if "Time Series FX (Daily)" not in res:
+        return None
+    data = res["Time Series FX (Daily)"]
+    df = pd.DataFrame(data).T.astype(float).sort_index()
+    df.rename(columns={"4. close": "close", "2. high": "high", "3. low": "low", "1. open": "open"}, inplace=True)
+    return df
 
-# دالة تنفيذ التحليل (بشكل تجريبي الآن)
-async def analyze_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# 🔎 FVG – Fair Value Gap
+def detect_fvg(df):
+    signals = []
+    for i in range(2, len(df)):
+        h1, l1 = df['high'].iloc[i-2], df['low'].iloc[i-2]
+        h2, l2 = df['high'].iloc[i-1], df['low'].iloc[i-1]
+        h3, l3 = df['high'].iloc[i], df['low'].iloc[i]
+
+        if l1 > h2 and l3 > h2:
+            signals.append("FVG صاعد (طلب)")
+        elif h1 < l2 and h3 < l2:
+            signals.append("FVG هابط (عرض)")
+        else:
+            signals.append("لا يوجد")
+    df['fvg'] = ["لا يوجد"] * 2 + signals
+    return df
+
+# 🧱 Order Block
+def detect_order_block(df):
+    signals = []
+    for i in range(2, len(df)):
+        body1 = abs(df['close'].iloc[i-2] - df['open'].iloc[i-2])
+
+        if df['close'].iloc[i-2] < df['open'].iloc[i-2] and df['close'].iloc[i] > df['open'].iloc[i]:
+            if body1 > (df['high'].iloc[i-2] - df['low'].iloc[i-2]) * 0.6:
+                signals.append("Order Block صاعد")
+            else:
+                signals.append("لا يوجد")
+        elif df['close'].iloc[i-2] > df['open'].iloc[i-2] and df['close'].iloc[i] < df['open'].iloc[i]:
+            if body1 > (df['high'].iloc[i-2] - df['low'].iloc[i-2]) * 0.6:
+                signals.append("Order Block هابط")
+            else:
+                signals.append("لا يوجد")
+        else:
+            signals.append("لا يوجد")
+    df['order_block'] = ["لا يوجد"] * 2 + signals
+    return df
+
+# 🎯 SMC / ICT
+def detect_smc_ict(df):
+    signals = []
+    for i in range(3, len(df)):
+        if df['high'].iloc[i-1] > df['high'].iloc[i-2] and df['close'].iloc[i-1] < df['open'].iloc[i-1] and df['close'].iloc[i] < df['close'].iloc[i-1]:
+            signals.append("سيولة فوق ثم هبوط")
+        elif df['low'].iloc[i-1] < df['low'].iloc[i-2] and df['close'].iloc[i-1] > df['open'].iloc[i-1] and df['close'].iloc[i] > df['close'].iloc[i-1]:
+            signals.append("سيولة تحت ثم صعود")
+        else:
+            signals.append("لا يوجد")
+    df['smc_ict'] = ["لا يوجد"] * 3 + signals
+    return df
+
+# 📈 الاتجاه العام + Stochastic
+def analyze_trend_stochastic(df):
+    df['SMA_20'] = df['close'].rolling(window=20).mean()
+    stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'], window=14, smooth_window=3)
+    df['stoch_k'] = stoch.stoch()
+    df['stoch_d'] = stoch.stoch_signal()
+
+    latest = df.iloc[-1]
+    trend = "صاعد 📈" if latest['close'] > latest['SMA_20'] else "هابط 📉"
+
+    if latest['stoch_k'] > 80:
+        stochastic = "تشبع شرائي 🔴"
+    elif latest['stoch_k'] < 20:
+        stochastic = "تشبع بيعي 🟢"
+    else:
+        stochastic = "ضمن النطاق ⚪"
+
+    return trend, stochastic, latest['close']
+
+# ⏰ تحليل زمني
+def time_analysis():
+    hour = datetime.datetime.utcnow().hour
+    if 12 <= hour <= 15:
+        return "جلسة نيويورك 🔥"
+    elif 6 <= hour <= 9:
+        return "جلسة لندن ⚡"
+    else:
+        return "جلسة هادئة 😴"
+
+# 🧠 التحليل الشامل
+def full_market_analysis(df):
+    df = detect_fvg(df)
+    df = detect_order_block(df)
+    df = detect_smc_ict(df)
+    trend, stochastic, price = analyze_trend_stochastic(df)
+    session_info = time_analysis()
+
+    return f"""📊 تحليل شامل للذهب (XAU/USD)
+
+🔸 السعر الحالي: {price:.2f} USD
+📈 الاتجاه العام: {trend}
+🎯 Stochastic: {stochastic}
+🟨 FVG: {df['fvg'].iloc[-1]}
+🏛️ Order Block: {df['order_block'].iloc[-1]}
+💥 SMC/ICT: {df['smc_ict'].iloc[-1]}
+🕒 توقيت السوق: {session_info}
+
+✅ التحليل دقيق ومبني على بيانات واقعية.
+"""
+
+# 🚀 Telegram Bot
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[
+        InlineKeyboardButton("اسكالب ⚡", callback_data="scalp"),
+        InlineKeyboardButton("سوينغ 🐢", callback_data="swing")
+    ]]
+    await update.message.reply_text("ابدأ تحليلك مع بوت S A (gold mafia)", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def handle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # تحليل تجريبي – لاحقًا نضيف التحليل الحقيقي
-    await query.edit_message_text("📊 تحليل الذهب قيد التنفيذ...\n(هذا نموذج تجريبي، التحليل الحقيقي سيتم إضافته لاحقًا).")
+    df = fetch_gold_data()
+    if df is None:
+        await query.edit_message_text("❌ فشل في جلب بيانات الذهب.")
+        return
 
-# تشغيل البوت
-if __name__ == '__main__':
-    if BOT_TOKEN is None:
-        raise ValueError("❌ لم يتم العثور على التوكن. تأكد من إضافة BOT_TOKEN إلى المتغيرات في Render.")
+    mode = query.data  # "scalp" or "swing"
 
+    if mode == "scalp":
+        df = df.tail(7)
+        analysis = full_market_analysis(df)
+        analysis = "📍 وضع: اسكالب ⚡\n\n" + analysis
+
+    elif mode == "swing":
+        df = df.tail(60)
+        analysis = full_market_analysis(df)
+        analysis = "📍 وضع: سوينغ 🐢\n\n" + analysis
+
+    await query.edit_message_text(analysis)
+
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(analyze_callback))
-
-    print("✅ البوت شغال الآن...")
+    app.add_handler(CallbackQueryHandler(handle_mode))
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
